@@ -1,0 +1,16 @@
+# Environment variables
+.env
+
+# Virtual environment
+.venv/
+
+# Telethon session files
+*.session
+*.session-journal
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+
