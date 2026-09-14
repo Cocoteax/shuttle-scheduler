@@ -1,14 +1,29 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import os
 import sys
+from typing import Any
 import zoneinfo
 from dotenv import load_dotenv
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, functions, types
 
 SESSION_NAME = "shuttle_scheduler"
 SINGAPORE_TZ = zoneinfo.ZoneInfo("Asia/Singapore")
 MAX_DAYS_LIMIT = 14
+
+
+@dataclass
+class Destination:
+    """Resolved Telegram scheduling destination."""
+
+    name: str  # Display name
+    type: str  # "Saved Messages", "Private chat", "Group", or "Forum topic"
+    entity: Any  # Telethon InputPeer or 'me'
+    raw_entity: Any = None  # Telethon User, Chat, or Channel
+    group_name: str | None = None
+    topic_name: str | None = None
+    topic_id: int | None = None
 
 
 def format_telegram_error(exc: Exception) -> str:
@@ -19,6 +34,10 @@ def format_telegram_error(exc: Exception) -> str:
         return "Posting restricted: You are restricted or banned from sending messages in this group."
     elif isinstance(exc, errors.ChatAdminRequiredError):
         return "Admin privileges required: Only group administrators may post or schedule messages here."
+    elif isinstance(exc, errors.TopicDeletedError):
+        return "Topic not found: The selected forum topic has been deleted."
+    elif isinstance(exc, errors.ChannelForumMissingError):
+        return "Forum missing: This supergroup does not have forum topics enabled."
     elif isinstance(exc, errors.ScheduleTooMuchError):
         return "Schedule limit reached: Telegram limit for scheduled messages in this chat has been exceeded."
     elif isinstance(exc, errors.ScheduleDateInvalidError):
@@ -32,6 +51,10 @@ def format_telegram_error(exc: Exception) -> str:
         wait_text = f"{secs} seconds" if secs else "required period"
         return f"Slow mode active: Please wait {wait_text} between messages in this chat."
     elif isinstance(exc, errors.RPCError):
+        if getattr(exc, "message", None) == "TOPIC_CLOSED":
+            return "Topic closed: This topic has been closed to new messages."
+        elif getattr(exc, "message", None) == "TOPIC_DELETED":
+            return "Topic deleted: The selected forum topic has been deleted."
         return f"Telegram RPC error: {exc.message}"
     else:
         return f"Error: {exc}"
@@ -56,7 +79,7 @@ def classify_dialog(dialog):
 
 async def check_can_send_to_entity(client, entity):
     """
-    Check if the user has permission to send messages to the given entity.
+    Check if the user has permission to send messages to the given entity (User, Chat, or Channel).
     Returns (can_send: bool, reason: str | None).
     """
     if getattr(entity, "deleted", False):
@@ -69,7 +92,7 @@ async def check_can_send_to_entity(client, entity):
     # User's personal banned rights in this group/channel
     user_banned = getattr(entity, "banned_rights", None)
     if user_banned and getattr(user_banned, "send_messages", False):
-        return False, "You are restricted from sending messages in this group."
+        return False, "You are restricted from sending messages in this chat."
 
     # Default banned rights if user is not creator or admin
     is_creator = getattr(entity, "creator", False)
@@ -77,7 +100,7 @@ async def check_can_send_to_entity(client, entity):
     if not is_creator and not admin_rights:
         default_banned = getattr(entity, "default_banned_rights", None)
         if default_banned and getattr(default_banned, "send_messages", False):
-            return False, "This group is read-only (messages restricted by group settings)."
+            return False, "This chat is read-only (messages restricted by group settings)."
 
     # Telethon participant permissions check
     try:
@@ -86,15 +109,145 @@ async def check_can_send_to_entity(client, entity):
             if perms.is_banned:
                 p_banned = getattr(perms.participant, "banned_rights", None)
                 if p_banned and getattr(p_banned, "send_messages", False):
-                    return False, "You are restricted from sending messages in this group."
-                return False, "You are banned from this group."
+                    return False, "You are restricted from sending messages in this chat."
+                return False, "You are banned from this chat."
             if perms.has_left:
-                return False, "You have left this group."
+                return False, "You have left this chat."
     except Exception:
         # Fallback to server-side check on send
         pass
 
     return True, None
+
+
+async def fetch_all_forum_topics(client, group_entity):
+    """
+    Retrieve all forum topics for a forum-enabled supergroup using Telethon's GetForumTopicsRequest.
+    Handles pagination.
+    Returns list of dicts: [{'id': int, 'title': str, 'closed': bool, 'hidden': bool}, ...]
+    """
+    topics = []
+    seen_ids = set()
+    offset_date = None
+    offset_id = 0
+    offset_topic = 0
+    limit = 100
+
+    while True:
+        res = await client(
+            functions.messages.GetForumTopicsRequest(
+                peer=group_entity,
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=limit,
+            )
+        )
+
+        if not res or not res.topics:
+            break
+
+        new_topics_found = 0
+        last_topic = None
+
+        for t in res.topics:
+            last_topic = t
+            if isinstance(t, types.ForumTopic):
+                if t.id not in seen_ids:
+                    seen_ids.add(t.id)
+                    topics.append({
+                        "id": t.id,
+                        "title": t.title or ("General" if t.id == 1 else f"Topic {t.id}"),
+                        "closed": bool(getattr(t, "closed", False)),
+                        "hidden": bool(getattr(t, "hidden", False)),
+                    })
+                    new_topics_found += 1
+
+        if len(res.topics) < limit or new_topics_found == 0 or last_topic is None:
+            break
+
+        offset_date = getattr(last_topic, "date", None)
+        offset_id = getattr(last_topic, "top_message", getattr(last_topic, "id", 0))
+        offset_topic = getattr(last_topic, "id", 0)
+
+    return topics
+
+
+async def select_topic_for_forum_group(
+    client: TelegramClient,
+    group_name: str,
+    group_input_entity,
+    group_raw_entity,
+) -> Destination | None:
+    """
+    Display topic selection interface for a forum-enabled supergroup.
+    Returns a resolved Destination object if a topic is selected, or None if user went back.
+    """
+    print(f"\nRetrieving topics for '{group_name}'...")
+    try:
+        topics = await fetch_all_forum_topics(client, group_input_entity)
+    except Exception as exc:
+        err_msg = format_telegram_error(exc)
+        print(f"\nFailed to retrieve forum topics for '{group_name}': {err_msg}", file=sys.stderr)
+        input("Press Enter to return...")
+        return None
+
+    if not topics:
+        print(f"\nNo active forum topics found in '{group_name}'.")
+        input("Press Enter to return...")
+        return None
+
+    while True:
+        print("\n========================================")
+        print("SELECT TOPIC")
+        print("========================================")
+        print(f"\nGroup:\n{group_name}\n")
+
+        for idx, t in enumerate(topics, start=1):
+            closed_label = " [Closed]" if t["closed"] else ""
+            print(f"[{idx}] {t['title']}{closed_label}")
+
+        print("\n[B] Back")
+        print("[Q] Quit\n")
+
+        sel = input("Select topic:\n> ").strip()
+
+        if sel.lower() == "b":
+            return None
+        elif sel.lower() == "q":
+            print("\nExiting Shuttle Scheduler.")
+            sys.exit(0)
+
+        if sel.isdigit():
+            idx = int(sel)
+            if 1 <= idx <= len(topics):
+                chosen_topic = topics[idx - 1]
+                if chosen_topic["closed"]:
+                    is_admin = getattr(group_raw_entity, "creator", False) or getattr(
+                        group_raw_entity, "admin_rights", None
+                    )
+                    if not is_admin:
+                        print(
+                            f"\nTopic '{chosen_topic['title']}' is closed. Only administrators can post here."
+                        )
+                        input("Press Enter to continue...")
+                        continue
+
+                return Destination(
+                    name=f"{group_name} — {chosen_topic['title']}",
+                    type="Forum topic",
+                    entity=group_input_entity,
+                    raw_entity=group_raw_entity,
+                    group_name=group_name,
+                    topic_name=chosen_topic["title"],
+                    topic_id=chosen_topic["id"],
+                )
+            else:
+                print(
+                    f"Invalid selection. Please enter a number between 1 and {len(topics)}."
+                )
+        else:
+            print("Invalid option. Please try again.")
 
 
 def parse_interval_to_timedelta(interval_hours: float) -> timedelta:
@@ -354,12 +507,10 @@ def prompt_interval_parameters():
 
 async def run_scheduling_workflow(
     client: TelegramClient,
-    destination_name: str,
-    destination_type: str,
-    destination_entity,
-):
+    destination: Destination,
+) -> bool:
     """
-    Unified scheduling workflow shared across Saved Messages, Private chats, and Groups.
+    Unified scheduling workflow shared across Saved Messages, Private chats, Groups, and Forum Topics.
     Returns True if completed and should exit, or False if user went back.
     """
     # 1. Message Entry
@@ -384,8 +535,14 @@ async def run_scheduling_workflow(
             print("\n========================================")
             print("SCHEDULE CONFIRMATION")
             print("========================================")
-            print(f"\nDestination:\n{destination_name}\n")
-            print(f"Type:\n{destination_type}\n")
+            if destination.type == "Forum topic":
+                print("\nDestination type:\nForum topic\n")
+                print(f"Group:\n{destination.group_name}\n")
+                print(f"Topic:\n{destination.topic_name}\n")
+            else:
+                print(f"\nDestination:\n{destination.name}\n")
+                print(f"Type:\n{destination.type}\n")
+
             print(
                 f"Scheduled:\n{scheduled_dt.strftime('%d/%m/%Y %H:%M')} Asia/Singapore\n"
             )
@@ -399,15 +556,25 @@ async def run_scheduling_workflow(
                 if confirm in ("y", "yes"):
                     print("\nSubmitting scheduled message to Telegram servers...")
                     try:
+                        send_kwargs = {"schedule": scheduled_dt}
+                        if destination.topic_id is not None:
+                            send_kwargs["reply_to"] = destination.topic_id
+
                         await client.send_message(
-                            destination_entity,
+                            destination.entity,
                             message_text,
-                            schedule=scheduled_dt,
+                            **send_kwargs,
                         )
                         print("\n========================================")
                         print("SCHEDULING COMPLETE")
                         print("========================================")
-                        print(f"\nDestination:\n{destination_name}")
+                        if destination.type == "Forum topic":
+                            print("\nDestination type:\nForum topic")
+                            print(f"\nGroup:\n{destination.group_name}")
+                            print(f"\nTopic:\n{destination.topic_name}")
+                        else:
+                            print(f"\nDestination:\n{destination.name}")
+
                         print("\nSuccessfully scheduled:\n1")
                         print("\nFailed:\n0")
                         print(
@@ -444,8 +611,14 @@ async def run_scheduling_workflow(
             print("\n========================================")
             print("SCHEDULE PREVIEW")
             print("========================================")
-            print(f"\nDestination:\n{destination_name}\n")
-            print(f"Type:\n{destination_type}\n")
+            if destination.type == "Forum topic":
+                print("\nDestination type:\nForum topic\n")
+                print(f"Group:\n{destination.group_name}\n")
+                print(f"Topic:\n{destination.topic_name}\n")
+            else:
+                print(f"\nDestination:\n{destination.name}\n")
+                print(f"Type:\n{destination.type}\n")
+
             print("Message:")
             print("----------------------------------------")
             print(message_text)
@@ -473,9 +646,14 @@ async def run_scheduling_workflow(
             print("========================================\n")
 
             print("WARNING:")
-            print(
-                f"You are about to schedule {total_count} messages to:\n{destination_name}\n"
-            )
+            if destination.type == "Forum topic":
+                print(
+                    f"You are about to schedule {total_count} messages to:\nGroup: {destination.group_name}\nTopic: {destination.topic_name}\n"
+                )
+            else:
+                print(
+                    f"You are about to schedule {total_count} messages to:\n{destination.name}\n"
+                )
 
             while True:
                 confirm = (
@@ -492,10 +670,14 @@ async def run_scheduling_workflow(
 
                     for dt in all_scheduled_dts:
                         try:
+                            send_kwargs = {"schedule": dt}
+                            if destination.topic_id is not None:
+                                send_kwargs["reply_to"] = destination.topic_id
+
                             await client.send_message(
-                                destination_entity,
+                                destination.entity,
                                 message_text,
-                                schedule=dt,
+                                **send_kwargs,
                             )
                             success_count += 1
                         except Exception as exc:
@@ -509,7 +691,13 @@ async def run_scheduling_workflow(
                     print("\n========================================")
                     print("SCHEDULING COMPLETE")
                     print("========================================")
-                    print(f"\nDestination:\n{destination_name}")
+                    if destination.type == "Forum topic":
+                        print("\nDestination type:\nForum topic")
+                        print(f"\nGroup:\n{destination.group_name}")
+                        print(f"\nTopic:\n{destination.topic_name}")
+                    else:
+                        print(f"\nDestination:\n{destination.name}")
+
                     print(f"\nSuccessfully scheduled:\n{success_count}")
                     print(f"\nFailed:\n{failed_count}")
 
@@ -656,14 +844,14 @@ async def main():
 
             choice = input("Select:\n> ").strip()
 
-            destination_name = None
-            destination_type = None
-            destination_entity = None
+            destination: Destination | None = None
 
             if choice == "1":
-                destination_name = "Saved Messages"
-                destination_type = "Saved Messages"
-                destination_entity = "me"
+                destination = Destination(
+                    name="Saved Messages",
+                    type="Saved Messages",
+                    entity="me",
+                )
 
             elif choice == "2":
                 while True:
@@ -692,13 +880,29 @@ async def main():
                         idx = int(sel)
                         if 1 <= idx <= len(private_chats):
                             chosen = private_chats[idx - 1]
-                            destination_name = (
+                            pc_name = (
                                 chosen.name.strip()
                                 if chosen.name and chosen.name.strip()
                                 else f"User {chosen.id}"
                             )
-                            destination_type = "Private chat"
-                            destination_entity = chosen.input_entity
+
+                            # Validate recipient permissions
+                            can_send, reason = await check_can_send_to_entity(
+                                client, chosen.entity
+                            )
+                            if not can_send:
+                                print(
+                                    f"\nCannot schedule to '{pc_name}': {reason}"
+                                )
+                                input("Press Enter to continue...")
+                                continue
+
+                            destination = Destination(
+                                name=pc_name,
+                                type="Private chat",
+                                entity=chosen.input_entity,
+                                raw_entity=chosen.entity,
+                            )
                             break
                         else:
                             print(
@@ -707,7 +911,7 @@ async def main():
                     else:
                         print("Invalid option. Please try again.")
 
-                if not destination_entity:
+                if not destination:
                     continue
 
             elif choice == "3":
@@ -754,10 +958,27 @@ async def main():
                                 input("Press Enter to continue...")
                                 continue
 
-                            destination_name = grp_name
-                            destination_type = "Group"
-                            destination_entity = chosen.input_entity
-                            break
+                            # Detect whether it is a forum group
+                            is_forum = getattr(chosen.entity, "forum", False)
+                            if is_forum:
+                                destination = await select_topic_for_forum_group(
+                                    client=client,
+                                    group_name=grp_name,
+                                    group_input_entity=chosen.input_entity,
+                                    group_raw_entity=chosen.entity,
+                                )
+                                if not destination:
+                                    continue
+                                break
+                            else:
+                                destination = Destination(
+                                    name=grp_name,
+                                    type="Group",
+                                    entity=chosen.input_entity,
+                                    raw_entity=chosen.entity,
+                                    group_name=grp_name,
+                                )
+                                break
                         else:
                             print(
                                 f"Invalid selection. Please enter a number between 1 and {len(groups)}."
@@ -765,7 +986,7 @@ async def main():
                     else:
                         print("Invalid option. Please try again.")
 
-                if not destination_entity:
+                if not destination:
                     continue
 
             elif choice == "4":
@@ -806,10 +1027,38 @@ async def main():
                                         input("Press Enter to continue...")
                                         continue
 
-                                destination_name = chosen["name"]
-                                destination_type = chosen["type"]
-                                destination_entity = chosen["entity"]
-                                break
+                                # Check if it is a forum group
+                                if chosen["type"] == "Group":
+                                    is_forum = getattr(
+                                        chosen["raw_entity"], "forum", False
+                                    )
+                                    if is_forum:
+                                        destination = await select_topic_for_forum_group(
+                                            client=client,
+                                            group_name=chosen["name"],
+                                            group_input_entity=chosen["entity"],
+                                            group_raw_entity=chosen["raw_entity"],
+                                        )
+                                        if not destination:
+                                            continue
+                                        break
+                                    else:
+                                        destination = Destination(
+                                            name=chosen["name"],
+                                            type="Group",
+                                            entity=chosen["entity"],
+                                            raw_entity=chosen["raw_entity"],
+                                            group_name=chosen["name"],
+                                        )
+                                        break
+                                else:
+                                    destination = Destination(
+                                        name=chosen["name"],
+                                        type=chosen["type"],
+                                        entity=chosen["entity"],
+                                        raw_entity=chosen.get("raw_entity"),
+                                    )
+                                    break
                         else:
                             print(
                                 f"Invalid selection. Please enter a number between 1 and {len(full_list)}."
@@ -817,7 +1066,7 @@ async def main():
                     else:
                         print("Invalid option. Please try again.")
 
-                if not destination_entity:
+                if not destination:
                     continue
 
             elif choice.lower() == "q":
@@ -831,9 +1080,7 @@ async def main():
             # Run unified scheduling workflow
             completed = await run_scheduling_workflow(
                 client=client,
-                destination_name=destination_name,
-                destination_type=destination_type,
-                destination_entity=destination_entity,
+                destination=destination,
             )
             if completed:
                 return
