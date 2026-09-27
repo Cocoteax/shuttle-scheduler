@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import os
 import sys
@@ -11,6 +11,10 @@ from telethon import TelegramClient, errors, functions, types
 SESSION_NAME = "shuttle_scheduler"
 SINGAPORE_TZ = zoneinfo.ZoneInfo("Asia/Singapore")
 MAX_DAYS_LIMIT = 14
+
+# Maximum Telegram scheduled messages allowed in a single multi-destination operation.
+# Change this value here to adjust the safety limit.
+MAX_MESSAGES_PER_OPERATION = 100
 
 
 @dataclass
@@ -320,7 +324,77 @@ def generate_interval_schedule(
     return schedule_by_date, total_generated, past_excluded
 
 
-def prompt_message():
+def parse_multi_selection(raw_input: str, max_index: int) -> list[int] | None:
+    """
+    Parse a comma-separated selection string (e.g. "1,3,4" or "2") into a sorted,
+    deduplicated list of 1-based integer indexes.
+
+    Returns the list of valid indexes, or None if the input is invalid.
+    Indexes must be between 1 and max_index (inclusive).
+    """
+    parts = raw_input.strip().split(",")
+    result = []
+    seen = set()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            return None
+        if not part.isdigit():
+            return None
+        idx = int(part)
+        if idx < 1 or idx > max_index:
+            return None
+        if idx not in seen:
+            seen.add(idx)
+            result.append(idx)
+    if not result:
+        return None
+    return sorted(result)
+
+
+def format_destination_label(dest: Destination) -> str:
+    """Return a concise one-line label for a Destination."""
+    if dest.type == "Forum topic":
+        return f"{dest.group_name} — {dest.topic_name}"
+    return dest.name
+
+
+def show_destination_review(destinations: list[Destination]) -> str:
+    """
+    Display the SELECTED DESTINATIONS review screen.
+    Returns the user's choice: 'c' (continue), 'b' (back), or 'q' (quit).
+    """
+    while True:
+        print("\n========================================")
+        print("SELECTED DESTINATIONS")
+        print("========================================\n")
+        for idx, dest in enumerate(destinations, start=1):
+            if dest.type == "Forum topic":
+                print(f"[{idx}] {dest.group_name} — {dest.topic_name}")
+                print(f"    Type: Forum topic")
+            else:
+                print(f"[{idx}] {dest.name}")
+                print(f"    Type: {dest.type}")
+            print()
+
+        print(f"Total destinations: {len(destinations)}")
+        print("\n[C] Continue")
+        print("[B] Back")
+        print("[Q] Quit\n")
+
+        sel = input("Select:\n> ").strip().lower()
+        if sel == "c":
+            return "c"
+        elif sel == "b":
+            return "b"
+        elif sel == "q":
+            print("\nExiting Shuttle Scheduler.")
+            sys.exit(0)
+        else:
+            print("Invalid option. Please choose C, B, or Q.")
+
+
+def prompt_message() -> str:
     """Prompt the user for a multiline message terminated with /done."""
     print("\nEnter your message below.")
     print("Type /done on its own line when finished.\n")
@@ -498,6 +572,7 @@ def prompt_interval_parameters():
             "schedule_by_date": schedule_by_date,
             "total_count": total_count,
             "past_excluded": past_excluded,
+            "start_date_str": start_date_str,
             "start_time_str": start_time.strftime("%H:%M"),
             "end_time_str": end_time.strftime("%H:%M"),
             "interval_hours": interval_hours,
@@ -507,11 +582,19 @@ def prompt_interval_parameters():
 
 async def run_scheduling_workflow(
     client: TelegramClient,
-    destination: Destination,
+    destinations: list[Destination],
 ) -> bool:
     """
-    Unified scheduling workflow shared across Saved Messages, Private chats, Groups, and Forum Topics.
-    Returns True if completed and should exit, or False if user went back.
+    Unified scheduling workflow for one or more resolved Destinations.
+
+    - Message is entered once.
+    - Schedule is configured once.
+    - Same message and timestamps are applied to every destination.
+    - Shows a FINAL SCHEDULE PREVIEW with total count before any submission.
+    - Applies MAX_MESSAGES_PER_OPERATION safety limit.
+    - Tracks per-destination results.
+
+    Returns True if completed (caller should exit), False if user went back.
     """
     # 1. Message Entry
     message_text = prompt_message()
@@ -529,67 +612,58 @@ async def run_scheduling_workflow(
         mode_choice = input("Select:\n> ").strip()
 
         if mode_choice == "1":
-            # Single scheduled message mode
+            # ── Single scheduled message ──────────────────────────────────────
             scheduled_dt = prompt_single_schedule_time()
+            all_scheduled_dts = [scheduled_dt]
 
+            num_destinations = len(destinations)
+            num_timestamps = 1
+            total_messages = num_destinations * num_timestamps
+
+            # Safety limit check
+            if total_messages > MAX_MESSAGES_PER_OPERATION:
+                print(f"\nThis operation would create {total_messages} Telegram scheduled messages.")
+                print(f"\nCurrent safety limit:\n{MAX_MESSAGES_PER_OPERATION} messages per operation.")
+                print("\nPlease reduce the number of destinations, scheduling times, or days.")
+                input("\nPress Enter to return to the menu...")
+                return False
+
+            # Final preview
             print("\n========================================")
-            print("SCHEDULE CONFIRMATION")
+            print("FINAL SCHEDULE PREVIEW")
             print("========================================")
-            if destination.type == "Forum topic":
-                print("\nDestination type:\nForum topic\n")
-                print(f"Group:\n{destination.group_name}\n")
-                print(f"Topic:\n{destination.topic_name}\n")
-            else:
-                print(f"\nDestination:\n{destination.name}\n")
-                print(f"Type:\n{destination.type}\n")
 
-            print(
-                f"Scheduled:\n{scheduled_dt.strftime('%d/%m/%Y %H:%M')} Asia/Singapore\n"
-            )
-            print("Message:")
+            print("\nDESTINATIONS\n")
+            for idx, dest in enumerate(destinations, start=1):
+                if dest.type == "Forum topic":
+                    print(f"[{idx}] {dest.group_name} — {dest.topic_name}")
+                    print(f"    Type: Forum topic")
+                else:
+                    print(f"[{idx}] {dest.name}")
+                    print(f"    Type: {dest.type}")
+                print()
+
             print("----------------------------------------")
+            print("\nMESSAGE\n")
             print(message_text)
+
+            print("\n----------------------------------------")
+            print("\nSCHEDULE\n")
+            print(f"Scheduled:\n{scheduled_dt.strftime('%d/%m/%Y %H:%M')} Asia/Singapore\n")
+
             print("----------------------------------------\n")
+            print(f"Destinations:\n{num_destinations}\n")
+            print(f"Scheduled timestamps:\n{num_timestamps}\n")
+            print(f"TOTAL TELEGRAM MESSAGES:\n{total_messages}")
+            print("\n========================================")
+
+            print(f"\nYou are about to schedule {total_messages} Telegram message(s)")
+            print(f"across {num_destinations} destination(s).\n")
 
             while True:
-                confirm = input("Schedule this message? (y/n):\n> ").strip().lower()
+                confirm = input("Proceed? (y/n):\n> ").strip().lower()
                 if confirm in ("y", "yes"):
-                    print("\nSubmitting scheduled message to Telegram servers...")
-                    try:
-                        send_kwargs = {"schedule": scheduled_dt}
-                        if destination.topic_id is not None:
-                            send_kwargs["reply_to"] = destination.topic_id
-
-                        await client.send_message(
-                            destination.entity,
-                            message_text,
-                            **send_kwargs,
-                        )
-                        print("\n========================================")
-                        print("SCHEDULING COMPLETE")
-                        print("========================================")
-                        if destination.type == "Forum topic":
-                            print("\nDestination type:\nForum topic")
-                            print(f"\nGroup:\n{destination.group_name}")
-                            print(f"\nTopic:\n{destination.topic_name}")
-                        else:
-                            print(f"\nDestination:\n{destination.name}")
-
-                        print("\nSuccessfully scheduled:\n1")
-                        print("\nFailed:\n0")
-                        print(
-                            f"\nFirst scheduled message:\n{scheduled_dt.strftime('%d/%m/%Y %H:%M')}"
-                        )
-                        print(
-                            f"\nLast scheduled message:\n{scheduled_dt.strftime('%d/%m/%Y %H:%M')}\n"
-                        )
-                        return True
-                    except Exception as exc:
-                        err_msg = format_telegram_error(exc)
-                        print(f"\nScheduling failed: {err_msg}", file=sys.stderr)
-                        input("\nPress Enter to return to the menu...")
-                        return False
-
+                    break
                 elif confirm in ("n", "no"):
                     print("\nScheduling cancelled.")
                     input("Press Enter to return to the menu...")
@@ -597,126 +671,261 @@ async def run_scheduling_workflow(
                 else:
                     print("Invalid input. Please enter 'y' for yes or 'n' for no.")
 
+            # Submission
+            print(f"\nSubmitting {total_messages} scheduled message(s) to Telegram servers...")
+            overall_success = 0
+            overall_failed = 0
+            per_dest_results: list[dict] = []
+            flood_abort = False
+
+            for dest in destinations:
+                dest_success = 0
+                dest_failed = 0
+                dest_errors: list[str] = []
+
+                if flood_abort:
+                    dest_failed += num_timestamps
+                    per_dest_results.append({
+                        "dest": dest,
+                        "success": dest_success,
+                        "failed": dest_failed,
+                        "errors": ["Submission stopped due to earlier flood/rate-limit error."],
+                    })
+                    overall_failed += dest_failed
+                    continue
+
+                for dt in all_scheduled_dts:
+                    try:
+                        send_kwargs: dict = {"schedule": dt}
+                        if dest.topic_id is not None:
+                            send_kwargs["reply_to"] = dest.topic_id
+                        await client.send_message(dest.entity, message_text, **send_kwargs)
+                        dest_success += 1
+                        overall_success += 1
+                    except errors.FloodWaitError as exc:
+                        dest_failed += 1
+                        overall_failed += 1
+                        err_msg = format_telegram_error(exc)
+                        dest_errors.append(f"{dt.strftime('%d/%m/%Y %H:%M')}: {err_msg}")
+                        flood_abort = True
+                        break
+                    except Exception as exc:
+                        dest_failed += 1
+                        overall_failed += 1
+                        err_msg = format_telegram_error(exc)
+                        dest_errors.append(f"{dt.strftime('%d/%m/%Y %H:%M')}: {err_msg}")
+
+                per_dest_results.append({
+                    "dest": dest,
+                    "success": dest_success,
+                    "failed": dest_failed,
+                    "errors": dest_errors,
+                })
+
+            # Result reporting
+            print("\n========================================")
+            print("SCHEDULING COMPLETE")
+            print("========================================")
+            print("\nOVERALL\n")
+            print(f"Successfully scheduled: {overall_success}")
+            print(f"Failed: {overall_failed}")
+            print(f"Total attempted: {overall_success + overall_failed}")
+
+            print("\n----------------------------------------")
+            print("\nBY DESTINATION\n")
+            for r in per_dest_results:
+                dest = r["dest"]
+                if dest.type == "Forum topic":
+                    print(f"{dest.group_name} — {dest.topic_name}")
+                else:
+                    print(dest.name)
+                print(f"  Successful: {r['success']}")
+                print(f"  Failed: {r['failed']}")
+                for err in r["errors"]:
+                    print(f"  ⚠ {err}", file=sys.stderr)
+                print()
+
+            print("========================================")
+
+            if flood_abort:
+                print(
+                    "\n⚠ Submission was stopped early due to a Telegram flood/rate-limit response.",
+                    file=sys.stderr,
+                )
+                print("Remaining messages were not submitted.", file=sys.stderr)
+
+            return True
+
         elif mode_choice == "2":
-            # Repeating interval schedule mode
+            # ── Repeating interval schedule ───────────────────────────────────
             interval_data = prompt_interval_parameters()
             schedule_by_date = interval_data["schedule_by_date"]
             total_count = interval_data["total_count"]
+            start_date_str = interval_data["start_date_str"]
             start_time_str = interval_data["start_time_str"]
             end_time_str = interval_data["end_time_str"]
             interval_hours = interval_data["interval_hours"]
             num_days = interval_data["num_days"]
 
-            # Display schedule preview
-            print("\n========================================")
-            print("SCHEDULE PREVIEW")
-            print("========================================")
-            if destination.type == "Forum topic":
-                print("\nDestination type:\nForum topic\n")
-                print(f"Group:\n{destination.group_name}\n")
-                print(f"Topic:\n{destination.topic_name}\n")
-            else:
-                print(f"\nDestination:\n{destination.name}\n")
-                print(f"Type:\n{destination.type}\n")
-
-            print("Message:")
-            print("----------------------------------------")
-            print(message_text)
-            print("----------------------------------------\n")
-            print(f"Interval:\nEvery {interval_hours:g} hours\n")
-            print(f"Daily window:\n{start_time_str} - {end_time_str}\n")
-            print(f"Days:\n{num_days}\n")
-            print("Generated schedule:\n")
-
+            # Flatten timestamps for submission
             all_scheduled_dts = []
-            for day_idx, (day_date, times) in enumerate(
-                schedule_by_date.items(), start=1
-            ):
+            for day_date in sorted(schedule_by_date):
+                all_scheduled_dts.extend(schedule_by_date[day_date])
+
+            num_destinations = len(destinations)
+            num_timestamps = total_count
+            total_messages = num_destinations * num_timestamps
+
+            # Safety limit check
+            if total_messages > MAX_MESSAGES_PER_OPERATION:
+                print(f"\nThis operation would create {total_messages} Telegram scheduled messages.")
+                print(f"\nCurrent safety limit:\n{MAX_MESSAGES_PER_OPERATION} messages per operation.")
+                print("\nPlease reduce the number of destinations, scheduling times, or days.")
+                input("\nPress Enter to return to the menu...")
+                return False
+
+            # Final preview
+            print("\n========================================")
+            print("FINAL SCHEDULE PREVIEW")
+            print("========================================")
+
+            print("\nDESTINATIONS\n")
+            for idx, dest in enumerate(destinations, start=1):
+                if dest.type == "Forum topic":
+                    print(f"[{idx}] {dest.group_name} — {dest.topic_name}")
+                    print(f"    Type: Forum topic")
+                else:
+                    print(f"[{idx}] {dest.name}")
+                    print(f"    Type: {dest.type}")
+                print()
+
+            print("----------------------------------------")
+            print("\nMESSAGE\n")
+            print(message_text)
+
+            print("\n----------------------------------------")
+            print("\nSCHEDULE\n")
+            print(f"Start date:\n{start_date_str}\n")
+            print(f"Daily window:\n{start_time_str} - {end_time_str}\n")
+            print(f"Interval:\nEvery {interval_hours:g} hours\n")
+            print(f"Days:\n{num_days}\n")
+            print("Generated times:\n")
+
+            for day_idx, day_date in enumerate(sorted(schedule_by_date), start=1):
+                times = schedule_by_date[day_date]
                 date_formatted = day_date.strftime("%d/%m/%Y")
                 print(f"DAY {day_idx} — {date_formatted}")
                 if not times:
                     print("  (All times on this day have already passed)")
                 else:
-                    for t_idx, dt in enumerate(times, start=1):
-                        print(f"[{t_idx}] {dt.strftime('%H:%M')}")
-                        all_scheduled_dts.append(dt)
+                    for dt in times:
+                        print(f"  {dt.strftime('%H:%M')}")
                 print()
 
-            print(f"Total messages to schedule:\n{total_count}")
-            print("========================================\n")
+            print("----------------------------------------\n")
+            print(f"Destinations:\n{num_destinations}\n")
+            print(f"Scheduled timestamps:\n{num_timestamps}\n")
+            print(f"TOTAL TELEGRAM MESSAGES:\n{total_messages}")
+            print("\n========================================")
 
-            print("WARNING:")
-            if destination.type == "Forum topic":
-                print(
-                    f"You are about to schedule {total_count} messages to:\nGroup: {destination.group_name}\nTopic: {destination.topic_name}\n"
-                )
-            else:
-                print(
-                    f"You are about to schedule {total_count} messages to:\n{destination.name}\n"
-                )
+            print(f"\nYou are about to schedule {total_messages} Telegram message(s)")
+            print(f"across {num_destinations} destination(s).\n")
 
             while True:
-                confirm = (
-                    input(f"Schedule all {total_count} messages? (y/n):\n> ")
-                    .strip()
-                    .lower()
-                )
+                confirm = input("Proceed? (y/n):\n> ").strip().lower()
                 if confirm in ("y", "yes"):
-                    print(
-                        f"\nSubmitting {total_count} scheduled messages to Telegram servers..."
-                    )
-                    success_count = 0
-                    failed_count = 0
-
-                    for dt in all_scheduled_dts:
-                        try:
-                            send_kwargs = {"schedule": dt}
-                            if destination.topic_id is not None:
-                                send_kwargs["reply_to"] = destination.topic_id
-
-                            await client.send_message(
-                                destination.entity,
-                                message_text,
-                                **send_kwargs,
-                            )
-                            success_count += 1
-                        except Exception as exc:
-                            failed_count += 1
-                            err_msg = format_telegram_error(exc)
-                            print(
-                                f"Failed to schedule for {dt.strftime('%d/%m/%Y %H:%M')}: {err_msg}",
-                                file=sys.stderr,
-                            )
-
-                    print("\n========================================")
-                    print("SCHEDULING COMPLETE")
-                    print("========================================")
-                    if destination.type == "Forum topic":
-                        print("\nDestination type:\nForum topic")
-                        print(f"\nGroup:\n{destination.group_name}")
-                        print(f"\nTopic:\n{destination.topic_name}")
-                    else:
-                        print(f"\nDestination:\n{destination.name}")
-
-                    print(f"\nSuccessfully scheduled:\n{success_count}")
-                    print(f"\nFailed:\n{failed_count}")
-
-                    if success_count > 0:
-                        print(
-                            f"\nFirst scheduled message:\n{all_scheduled_dts[0].strftime('%d/%m/%Y %H:%M')}"
-                        )
-                        print(
-                            f"\nLast scheduled message:\n{all_scheduled_dts[-1].strftime('%d/%m/%Y %H:%M')}"
-                        )
-                    print()
-                    return True
-
+                    break
                 elif confirm in ("n", "no"):
                     print("\nScheduling cancelled. 0 messages scheduled.")
                     input("Press Enter to return to the menu...")
                     return False
                 else:
                     print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+
+            # Submission
+            print(f"\nSubmitting {total_messages} scheduled message(s) to Telegram servers...")
+            overall_success = 0
+            overall_failed = 0
+            per_dest_results: list[dict] = []
+            flood_abort = False
+
+            for dest in destinations:
+                dest_success = 0
+                dest_failed = 0
+                dest_errors: list[str] = []
+
+                if flood_abort:
+                    dest_failed += num_timestamps
+                    per_dest_results.append({
+                        "dest": dest,
+                        "success": dest_success,
+                        "failed": dest_failed,
+                        "errors": ["Submission stopped due to earlier flood/rate-limit error."],
+                    })
+                    overall_failed += dest_failed
+                    continue
+
+                for dt in all_scheduled_dts:
+                    try:
+                        send_kwargs: dict = {"schedule": dt}
+                        if dest.topic_id is not None:
+                            send_kwargs["reply_to"] = dest.topic_id
+                        await client.send_message(dest.entity, message_text, **send_kwargs)
+                        dest_success += 1
+                        overall_success += 1
+                    except errors.FloodWaitError as exc:
+                        dest_failed += 1
+                        overall_failed += 1
+                        err_msg = format_telegram_error(exc)
+                        dest_errors.append(f"{dt.strftime('%d/%m/%Y %H:%M')}: {err_msg}")
+                        flood_abort = True
+                        break
+                    except Exception as exc:
+                        dest_failed += 1
+                        overall_failed += 1
+                        err_msg = format_telegram_error(exc)
+                        dest_errors.append(f"{dt.strftime('%d/%m/%Y %H:%M')}: {err_msg}")
+
+                per_dest_results.append({
+                    "dest": dest,
+                    "success": dest_success,
+                    "failed": dest_failed,
+                    "errors": dest_errors,
+                })
+
+            # Result reporting
+            print("\n========================================")
+            print("SCHEDULING COMPLETE")
+            print("========================================")
+            print("\nOVERALL\n")
+            print(f"Successfully scheduled: {overall_success}")
+            print(f"Failed: {overall_failed}")
+            print(f"Total attempted: {overall_success + overall_failed}")
+
+            print("\n----------------------------------------")
+            print("\nBY DESTINATION\n")
+            for r in per_dest_results:
+                dest = r["dest"]
+                if dest.type == "Forum topic":
+                    print(f"{dest.group_name} — {dest.topic_name}")
+                else:
+                    print(dest.name)
+                print(f"  Successful: {r['success']}")
+                print(f"  Failed: {r['failed']}")
+                for err in r["errors"]:
+                    print(f"  ⚠ {err}", file=sys.stderr)
+                print()
+
+            print("========================================")
+
+            if flood_abort:
+                print(
+                    "\n⚠ Submission was stopped early due to a Telegram flood/rate-limit response.",
+                    file=sys.stderr,
+                )
+                print("Remaining messages were not submitted.", file=sys.stderr)
+
+            return True
 
         elif mode_choice.lower() == "b":
             return False
@@ -727,6 +936,300 @@ async def run_scheduling_workflow(
 
         else:
             print("Invalid option. Please choose 1, 2, B, or Q.")
+
+
+# ── Multi-selection helpers ───────────────────────────────────────────────────
+
+async def resolve_group_destination(
+    client: TelegramClient,
+    grp_name: str,
+    input_entity,
+    raw_entity,
+) -> Destination | None:
+    """
+    Resolve a single group dialog entry into a Destination.
+    If forum-enabled, triggers topic selection.
+    Returns None if the user went back or quit during topic selection.
+    """
+    is_forum = getattr(raw_entity, "forum", False)
+    if is_forum:
+        return await select_topic_for_forum_group(
+            client=client,
+            group_name=grp_name,
+            group_input_entity=input_entity,
+            group_raw_entity=raw_entity,
+        )
+    else:
+        return Destination(
+            name=grp_name,
+            type="Group",
+            entity=input_entity,
+            raw_entity=raw_entity,
+            group_name=grp_name,
+        )
+
+
+def deduplicate_destinations(destinations: list[Destination]) -> list[Destination]:
+    """
+    Remove duplicate destinations based on (type, name, topic_id).
+    Preserves original order.
+    """
+    seen = set()
+    result = []
+    for dest in destinations:
+        key = (dest.type, dest.name, dest.topic_id)
+        if key not in seen:
+            seen.add(key)
+            result.append(dest)
+    return result
+
+
+async def select_private_chats_multi(
+    client: TelegramClient,
+    private_chats: list,
+) -> list[Destination] | None:
+    """
+    Multi-selection UI for Private Chats.
+    Returns a list of resolved Destinations, or None if the user went back.
+    """
+    while True:
+        print("\nPRIVATE CHATS\n")
+        if not private_chats:
+            print("No private chats found.")
+            print("\n[B] Back\n[Q] Quit\n")
+            sel = input("Select:\n> ").strip()
+            if sel.lower() == "q":
+                print("\nExiting Shuttle Scheduler.")
+                sys.exit(0)
+            return None
+
+        for idx, pc in enumerate(private_chats, start=1):
+            name = (
+                pc.name.strip() if pc.name and pc.name.strip() else f"User {pc.id}"
+            )
+            print(f"[{idx}] {name}")
+        print("\n[B] Back")
+        print("[Q] Quit\n")
+
+        sel = input("Select one or more:\n> ").strip()
+        if sel.lower() == "b":
+            return None
+        elif sel.lower() == "q":
+            print("\nExiting Shuttle Scheduler.")
+            sys.exit(0)
+
+        indexes = parse_multi_selection(sel, len(private_chats))
+        if indexes is None:
+            print(
+                f"Invalid selection. Enter one or more numbers between 1 and {len(private_chats)}, separated by commas."
+            )
+            continue
+
+        resolved: list[Destination] = []
+        skip = False
+        for idx in indexes:
+            chosen = private_chats[idx - 1]
+            pc_name = (
+                chosen.name.strip() if chosen.name and chosen.name.strip() else f"User {chosen.id}"
+            )
+            can_send, reason = await check_can_send_to_entity(client, chosen.entity)
+            if not can_send:
+                print(f"\nCannot schedule to '{pc_name}': {reason}")
+                input("Press Enter to continue...")
+                skip = True
+                break
+            resolved.append(
+                Destination(
+                    name=pc_name,
+                    type="Private chat",
+                    entity=chosen.input_entity,
+                    raw_entity=chosen.entity,
+                )
+            )
+
+        if skip:
+            continue
+
+        return deduplicate_destinations(resolved)
+
+
+async def select_groups_multi(
+    client: TelegramClient,
+    groups: list,
+) -> list[Destination] | None:
+    """
+    Multi-selection UI for Groups (including forum groups).
+    Returns a list of resolved Destinations, or None if the user went back.
+    """
+    while True:
+        print("\nGROUPS\n")
+        if not groups:
+            print("No groups found.")
+            print("\n[B] Back\n[Q] Quit\n")
+            sel = input("Select:\n> ").strip()
+            if sel.lower() == "q":
+                print("\nExiting Shuttle Scheduler.")
+                sys.exit(0)
+            return None
+
+        for idx, grp in enumerate(groups, start=1):
+            name = (
+                grp.name.strip() if grp.name and grp.name.strip() else f"Group {grp.id}"
+            )
+            is_forum = getattr(grp.entity, "forum", False)
+            forum_label = " [Forum]" if is_forum else ""
+            print(f"[{idx}] {name}{forum_label}")
+        print("\n[B] Back")
+        print("[Q] Quit\n")
+
+        sel = input("Select one or more:\n> ").strip()
+        if sel.lower() == "b":
+            return None
+        elif sel.lower() == "q":
+            print("\nExiting Shuttle Scheduler.")
+            sys.exit(0)
+
+        indexes = parse_multi_selection(sel, len(groups))
+        if indexes is None:
+            print(
+                f"Invalid selection. Enter one or more numbers between 1 and {len(groups)}, separated by commas."
+            )
+            continue
+
+        # Permission check pass
+        candidates = []
+        skip = False
+        for idx in indexes:
+            chosen = groups[idx - 1]
+            grp_name = (
+                chosen.name.strip() if chosen.name and chosen.name.strip() else f"Group {chosen.id}"
+            )
+            can_send, reason = await check_can_send_to_entity(client, chosen.entity)
+            if not can_send:
+                print(f"\nCannot schedule to '{grp_name}': {reason}")
+                input("Press Enter to continue...")
+                skip = True
+                break
+            candidates.append((grp_name, chosen.input_entity, chosen.entity))
+
+        if skip:
+            continue
+
+        # Resolve (forum → topic selection, normal → Destination)
+        resolved: list[Destination] = []
+        back_to_list = False
+        for grp_name, input_entity, raw_entity in candidates:
+            dest = await resolve_group_destination(client, grp_name, input_entity, raw_entity)
+            if dest is None:
+                # User went back during topic selection — restart group list
+                back_to_list = True
+                break
+            resolved.append(dest)
+
+        if back_to_list:
+            continue
+
+        return deduplicate_destinations(resolved)
+
+
+async def select_all_chats_multi(
+    client: TelegramClient,
+    full_list: list[dict],
+) -> list[Destination] | None:
+    """
+    Multi-selection UI for All Available Chats (mixed types).
+    Returns a list of resolved Destinations, or None if the user went back.
+    """
+    while True:
+        print("\nALL AVAILABLE CHATS\n")
+        for idx, chat in enumerate(full_list, start=1):
+            chat_type = chat["type"]
+            raw = chat.get("raw_entity")
+            is_forum = (
+                chat_type == "Group" and raw is not None and getattr(raw, "forum", False)
+            )
+            forum_label = " [Forum]" if is_forum else ""
+            print(f"[{idx}] {chat['name']} [{chat_type}]{forum_label}")
+
+        print("\n[B] Back")
+        print("[Q] Quit\n")
+
+        sel = input("Select one or more:\n> ").strip()
+        if sel.lower() == "b":
+            return None
+        elif sel.lower() == "q":
+            print("\nExiting Shuttle Scheduler.")
+            sys.exit(0)
+
+        indexes = parse_multi_selection(sel, len(full_list))
+        if indexes is None:
+            print(
+                f"Invalid selection. Enter one or more numbers between 1 and {len(full_list)}, separated by commas."
+            )
+            continue
+
+        # Validate schedulable + permissions
+        candidates = []
+        skip = False
+        for idx in indexes:
+            chosen = full_list[idx - 1]
+            if not chosen["schedulable"]:
+                print(f"\nScheduling to {chosen['type']} is not supported.")
+                input("Press Enter to continue...")
+                skip = True
+                break
+            if chosen.get("raw_entity"):
+                can_send, reason = await check_can_send_to_entity(client, chosen["raw_entity"])
+                if not can_send:
+                    print(f"\nCannot schedule to '{chosen['name']}': {reason}")
+                    input("Press Enter to continue...")
+                    skip = True
+                    break
+            candidates.append(chosen)
+
+        if skip:
+            continue
+
+        # Resolve candidates
+        resolved: list[Destination] = []
+        back_to_list = False
+        for chosen in candidates:
+            chat_type = chosen["type"]
+            raw = chosen.get("raw_entity")
+
+            if chat_type == "Group":
+                dest = await resolve_group_destination(
+                    client,
+                    chosen["name"],
+                    chosen["entity"],
+                    raw,
+                )
+                if dest is None:
+                    back_to_list = True
+                    break
+                resolved.append(dest)
+            elif chat_type == "Saved Messages":
+                resolved.append(
+                    Destination(
+                        name="Saved Messages",
+                        type="Saved Messages",
+                        entity="me",
+                    )
+                )
+            else:
+                resolved.append(
+                    Destination(
+                        name=chosen["name"],
+                        type=chat_type,
+                        entity=chosen["entity"],
+                        raw_entity=raw,
+                    )
+                )
+
+        if back_to_list:
+            continue
+
+        return deduplicate_destinations(resolved)
 
 
 async def main():
@@ -844,230 +1347,39 @@ async def main():
 
             choice = input("Select:\n> ").strip()
 
-            destination: Destination | None = None
+            resolved_destinations: list[Destination] = []
 
             if choice == "1":
-                destination = Destination(
-                    name="Saved Messages",
-                    type="Saved Messages",
-                    entity="me",
-                )
+                # Saved Messages — single-select (kept simple intentionally)
+                resolved_destinations = [
+                    Destination(
+                        name="Saved Messages",
+                        type="Saved Messages",
+                        entity="me",
+                    )
+                ]
 
             elif choice == "2":
-                while True:
-                    print("\nPRIVATE CHATS\n")
-                    if not private_chats:
-                        print("No private chats found.")
-                        print("\n[B] Back\n[Q] Quit\n")
-                    else:
-                        for idx, pc in enumerate(private_chats, start=1):
-                            name = (
-                                pc.name.strip()
-                                if pc.name and pc.name.strip()
-                                else f"User {pc.id}"
-                            )
-                            print(f"[{idx}] {name}")
-                        print("\n[B] Back")
-                        print("[Q] Quit\n")
-
-                    sel = input("Select a private chat:\n> ").strip()
-                    if sel.lower() == "b":
-                        break
-                    elif sel.lower() == "q":
-                        return
-
-                    if private_chats and sel.isdigit():
-                        idx = int(sel)
-                        if 1 <= idx <= len(private_chats):
-                            chosen = private_chats[idx - 1]
-                            pc_name = (
-                                chosen.name.strip()
-                                if chosen.name and chosen.name.strip()
-                                else f"User {chosen.id}"
-                            )
-
-                            # Validate recipient permissions
-                            can_send, reason = await check_can_send_to_entity(
-                                client, chosen.entity
-                            )
-                            if not can_send:
-                                print(
-                                    f"\nCannot schedule to '{pc_name}': {reason}"
-                                )
-                                input("Press Enter to continue...")
-                                continue
-
-                            destination = Destination(
-                                name=pc_name,
-                                type="Private chat",
-                                entity=chosen.input_entity,
-                                raw_entity=chosen.entity,
-                            )
-                            break
-                        else:
-                            print(
-                                f"Invalid selection. Please enter a number between 1 and {len(private_chats)}."
-                            )
-                    else:
-                        print("Invalid option. Please try again.")
-
-                if not destination:
+                # Private Chats — multi-select
+                result = await select_private_chats_multi(client, private_chats)
+                if result is None:
                     continue
+                resolved_destinations = result
 
             elif choice == "3":
-                while True:
-                    print("\nGROUPS\n")
-                    if not groups:
-                        print("No groups found.")
-                        print("\n[B] Back\n[Q] Quit\n")
-                    else:
-                        for idx, grp in enumerate(groups, start=1):
-                            name = (
-                                grp.name.strip()
-                                if grp.name and grp.name.strip()
-                                else f"Group {grp.id}"
-                            )
-                            print(f"[{idx}] {name}")
-                        print("\n[B] Back")
-                        print("[Q] Quit\n")
-
-                    sel = input("Select a group:\n> ").strip()
-                    if sel.lower() == "b":
-                        break
-                    elif sel.lower() == "q":
-                        return
-
-                    if groups and sel.isdigit():
-                        idx = int(sel)
-                        if 1 <= idx <= len(groups):
-                            chosen = groups[idx - 1]
-                            grp_name = (
-                                chosen.name.strip()
-                                if chosen.name and chosen.name.strip()
-                                else f"Group {chosen.id}"
-                            )
-
-                            # Validate group posting permissions
-                            can_send, reason = await check_can_send_to_entity(
-                                client, chosen.entity
-                            )
-                            if not can_send:
-                                print(
-                                    f"\nCannot schedule to '{grp_name}': {reason}"
-                                )
-                                input("Press Enter to continue...")
-                                continue
-
-                            # Detect whether it is a forum group
-                            is_forum = getattr(chosen.entity, "forum", False)
-                            if is_forum:
-                                destination = await select_topic_for_forum_group(
-                                    client=client,
-                                    group_name=grp_name,
-                                    group_input_entity=chosen.input_entity,
-                                    group_raw_entity=chosen.entity,
-                                )
-                                if not destination:
-                                    continue
-                                break
-                            else:
-                                destination = Destination(
-                                    name=grp_name,
-                                    type="Group",
-                                    entity=chosen.input_entity,
-                                    raw_entity=chosen.entity,
-                                    group_name=grp_name,
-                                )
-                                break
-                        else:
-                            print(
-                                f"Invalid selection. Please enter a number between 1 and {len(groups)}."
-                            )
-                    else:
-                        print("Invalid option. Please try again.")
-
-                if not destination:
+                # Groups — multi-select
+                result = await select_groups_multi(client, groups)
+                if result is None:
                     continue
+                resolved_destinations = result
 
             elif choice == "4":
+                # All available chats — multi-select
                 full_list = [saved_messages_entry] + all_chats
-                while True:
-                    print("\nALL AVAILABLE CHATS\n")
-                    for idx, chat in enumerate(full_list, start=1):
-                        print(f"[{idx}] {chat['name']} [{chat['type']}]")
-
-                    print("\n[B] Back")
-                    print("[Q] Quit\n")
-
-                    sel = input("Select a chat:\n> ").strip()
-                    if sel.lower() == "b":
-                        break
-                    elif sel.lower() == "q":
-                        return
-
-                    if sel.isdigit():
-                        idx = int(sel)
-                        if 1 <= idx <= len(full_list):
-                            chosen = full_list[idx - 1]
-                            if not chosen["schedulable"]:
-                                print(
-                                    f"\nScheduling to {chosen['type']} is not supported."
-                                )
-                                input("Press Enter to return to the menu...")
-                                break
-                            else:
-                                if chosen.get("raw_entity"):
-                                    can_send, reason = await check_can_send_to_entity(
-                                        client, chosen["raw_entity"]
-                                    )
-                                    if not can_send:
-                                        print(
-                                            f"\nCannot schedule to '{chosen['name']}': {reason}"
-                                        )
-                                        input("Press Enter to continue...")
-                                        continue
-
-                                # Check if it is a forum group
-                                if chosen["type"] == "Group":
-                                    is_forum = getattr(
-                                        chosen["raw_entity"], "forum", False
-                                    )
-                                    if is_forum:
-                                        destination = await select_topic_for_forum_group(
-                                            client=client,
-                                            group_name=chosen["name"],
-                                            group_input_entity=chosen["entity"],
-                                            group_raw_entity=chosen["raw_entity"],
-                                        )
-                                        if not destination:
-                                            continue
-                                        break
-                                    else:
-                                        destination = Destination(
-                                            name=chosen["name"],
-                                            type="Group",
-                                            entity=chosen["entity"],
-                                            raw_entity=chosen["raw_entity"],
-                                            group_name=chosen["name"],
-                                        )
-                                        break
-                                else:
-                                    destination = Destination(
-                                        name=chosen["name"],
-                                        type=chosen["type"],
-                                        entity=chosen["entity"],
-                                        raw_entity=chosen.get("raw_entity"),
-                                    )
-                                    break
-                        else:
-                            print(
-                                f"Invalid selection. Please enter a number between 1 and {len(full_list)}."
-                            )
-                    else:
-                        print("Invalid option. Please try again.")
-
-                if not destination:
+                result = await select_all_chats_multi(client, full_list)
+                if result is None:
                     continue
+                resolved_destinations = result
 
             elif choice.lower() == "q":
                 print("\nExiting Shuttle Scheduler.")
@@ -1077,10 +1389,19 @@ async def main():
                 print("Invalid option. Please choose 1, 2, 3, 4, or Q.")
                 continue
 
+            if not resolved_destinations:
+                continue
+
+            # Destination review screen (for clarity, shown for all paths including single)
+            review_choice = show_destination_review(resolved_destinations)
+            if review_choice == "b":
+                continue
+            # 'c' → fall through to scheduling workflow
+
             # Run unified scheduling workflow
             completed = await run_scheduling_workflow(
                 client=client,
-                destination=destination,
+                destinations=resolved_destinations,
             )
             if completed:
                 return
